@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import argparse
 import numpy as np
 import pickle
@@ -7,6 +8,7 @@ import torch.optim as optim
 from tqdm import tqdm
 import os
 import pandas as pd
+import torch.nn.functional as F
 
 import transformer.Constants as Constants
 import Utils
@@ -14,7 +16,7 @@ from preprocess.Dataset import get_dataloader
 from transformer.Layers import get_non_pad_mask
 from transformer.Models import FlowMatchingTHP
 from flow_matching.solver import ODESolver
-import torch
+
 torch.autograd.set_detect_anomaly(True)
 
 def prepare_dataloader(opt):
@@ -30,28 +32,12 @@ def prepare_dataloader(opt):
     dev_data, _ = load_data(opt.data + 'dev.pkl', 'dev')
     test_data, _ = load_data(opt.data + 'test.pkl', 'test')
 
-    time_flat = []
-    for i in train_data:
-        time_flat += [elem['time_since_last_event'] for elem in i if elem['time_since_last_event'] > 0]
-    time_flat = np.array(time_flat)
-
-    opt.time_max = np.max(time_flat)
-    opt.mean_data = time_flat.mean()
-
-    if opt.normalize == 'log':
-        time_flat_div = time_flat / opt.mean_data
-        log_time = np.log(time_flat_div + 1e-9)
-        opt.mean_log_data = log_time.mean()
-        opt.var_log_data = log_time.std()
-        print(f'[Info] Log Stats: Mean={opt.mean_log_data:.4f}, Std={opt.var_log_data:.4f}, Max={opt.time_max:.2f}')
-
     opt.max_len = 0
     trainloader = get_dataloader(train_data, opt, shuffle=True, split='train')
     devloader = get_dataloader(dev_data, opt, shuffle=False, split='dev')
     testloader = get_dataloader(test_data, opt, shuffle=False, split='test')
 
     return trainloader, devloader, testloader, num_types
-
 
 def train_epoch(model, training_data, optimizer, opt):
     model.train()
@@ -80,12 +66,10 @@ def train_epoch(model, training_data, optimizer, opt):
 
     return total_loss / total_events, total_fm / total_events, total_type / total_events
 
-
 def eval_epoch(model, validation_data, eval_generation, opt):
     model.eval()
 
     if not eval_generation:
-        
         total_loss = 0
         total_correct = 0
         total_events = 0
@@ -110,7 +94,7 @@ def eval_epoch(model, validation_data, eval_generation, opt):
         return avg_loss, avg_acc
 
     else:
-        
+        # Top-K Mixture Generation Logic
         class VelocityWrapper:
             def __init__(self, v_field, c_cond):
                 self.v_field = v_field
@@ -128,87 +112,131 @@ def eval_epoch(model, validation_data, eval_generation, opt):
         total_acc = 0
         total_events = 0
         
-        total_nll = 0.0
+        total_time_nll = 0.0
+        total_type_nll = 0.0
         total_nll_events = 0
-        total_se_real = 0.0 # Squared Error in Real Time
-        total_se_events = 0
+        total_sse = 0.0
 
         with torch.no_grad():
             for batch in tqdm(validation_data, desc='  - (Sampling)   ', leave=False):
                 event_time, time_gap_norm, event_type = map(lambda x: x.to(opt.device), batch)
 
-                # NLL Calculation (if supported by model)
+                # --- 1. NLL Calculation ---
                 if hasattr(model, 'get_exact_log_likelihood'):
-                    batch_nll_sum, batch_n_events = model.get_exact_log_likelihood(event_type, event_time, time_gap_norm)
-                    total_nll += batch_nll_sum.item()
+                    batch_time_nll_sum, batch_n_events = model.get_exact_log_likelihood(event_type, event_time, time_gap_norm)
+                    
+                    non_pad_mask = get_non_pad_mask(event_type)
+                    enc_output = model.encoder(event_type, event_time, non_pad_mask, time_gap_norm)
+                    c = enc_output[:, :-1, :]
+                    
+                    c_type = model.type_projector(c)
+                    type_logits = model.type_predictor(c_type)
+                    
+                    target_labels = event_type[:, 1:] - 1
+                    mask = (target_labels != -1)
+                    
+                    type_nll_loss = F.cross_entropy(
+                        type_logits.view(-1, model.num_types), 
+                        target_labels.view(-1), 
+                        reduction='none',
+                        ignore_index=-1
+                    )
+                    type_nll_sum = type_nll_loss.sum()
+                    
+                    total_time_nll += batch_time_nll_sum.item()
+                    total_type_nll += type_nll_sum.item()
                     total_nll_events += batch_n_events
 
+                # --- 2. Generation with Top-K Mixture ---
                 non_pad_mask = get_non_pad_mask(event_type)
-                enc_output = model.encoder(event_type, event_time, non_pad_mask)
+                enc_output = model.encoder(event_type, event_time, non_pad_mask, time_gap_norm)
                 c = enc_output[:, :-1, :]
-                B, L, D = c.shape
-                N = opt.n_samples
-
-                type_logits = model.type_predictor(c)
-                pred_types = type_logits.argmax(dim=-1)
-
-                pred_types_input = pred_types + 1
-                pred_type_emb = model.encoder.event_type_emb(pred_types_input)
-                c_cond = model.type_fusion(c, pred_type_emb)
-
-                c_cond_expanded = c_cond.repeat_interleave(N, dim=0)
                 
-                x0 = torch.randn(B * N, L, 1, device=opt.device) * opt.fm_sigma
+                # Decouple
+                c_type = model.type_projector(c)
+                c_time = model.time_projector(c)
 
-                wrapper = VelocityWrapper(model.v_field, c_cond_expanded)
+                B, L, D = c.shape
+                K = 3  # Top-3 Mixture
+
+                # 2.1 获取 Top-K 概率
+                type_logits = model.type_predictor(c_type)
+                type_probs = torch.softmax(type_logits, dim=-1) # (B, L, NumTypes)
+                topk_probs, topk_indices = torch.topk(type_probs, K, dim=-1) # (B, L, K)
+                topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True) # Normalize
+
+                # 2.2 准备 Mixture Condition
+                c_time_expanded = c_time.unsqueeze(2).expand(-1, -1, K, -1)
+                topk_type_emb = model.encoder.event_type_emb(topk_indices + 1)
+                
+                # Fusion
+                c_cond_k = model.type_fusion(c_time_expanded, topk_type_emb)
+                c_cond_flat = c_cond_k.view(B * L * K, D)
+
+                # 2.3 ODE 求解 (Single Path per K, Total K paths)
+                x0 = torch.randn(B * L * K, 1, 1, device=opt.device) * opt.fm_sigma
+                wrapper = VelocityWrapper(model.v_field, c_cond_flat.unsqueeze(1))
                 solver.velocity_model = wrapper
 
-                use_method = opt.solver_method
-                
-                solve_kwargs = {}
-                if use_method != 'dopri5':
-                    solve_kwargs['step_size'] = opt.solver_step_size
-
-                x1_norm = solver.sample(
+                x1_flat = solver.sample(
                     x0,
                     torch.tensor([0.0, 1.0]),
-                    method=use_method,
-                    **solve_kwargs
+                    method=opt.solver_method,
+                    step_size=opt.solver_step_size
                 )
                 
                 if opt.normalize == 'log':
-                    threshold = 8.0
-                    x1_norm = torch.clamp(x1_norm, max=threshold, min=-threshold)
+                    x1_flat = torch.clamp(x1_flat, min=-10.0, max=10.0)
 
-                # Denormalize Samples to Real Time
-                t_sample_norm = x1_norm.squeeze(-1).reshape(B, N, L).permute(0, 2, 1) 
-                t_sample_real = model.denormalize_time(t_sample_norm) # (B, L, N)
+                # 2.4 计算 Weighted Mean (用于 RMSE)
+                t_pred_k_norm = x1_flat.view(B, L, K)
+                t_pred_k_real = model.denormalize_time(t_pred_k_norm)
                 
-                t_pred_mean = t_sample_real.mean(dim=2) # (B, L)
+                # Expectation: Sum(Prob_k * Time_k)
+                t_pred_mean = (t_pred_k_real * topk_probs).sum(dim=-1) # (B, L)
 
-                # ==============================================================
-                # Fix: Add definition of t_gt_real before using it
-                # ==============================================================
+                # 2.5 计算 RMSE (使用 Top-K 期望值)
                 if opt.normalize == 'log':
-                    # Log transform inverse: exp(x * std + mean)
-                    t_gt_real = torch.exp(time_gap_norm * opt.var_log_data + opt.mean_log_data)
+                    gt_t_real = torch.exp(time_gap_norm * opt.var_log_data + opt.mean_log_data)
                 elif opt.normalize == 'normal':
-                    t_gt_real = time_gap_norm * opt.mean_data
+                    gt_t_real = time_gap_norm * opt.mean_data
                 else:
-                    t_gt_real = time_gap_norm
-                # ==============================================================
-
-                mask_loss = (event_type[:, 1:] != Constants.PAD)
-                diff = (t_pred_mean - t_gt_real)[mask_loss]
-                squared_error = (diff ** 2).sum().item()
+                    gt_t_real = time_gap_norm
                 
-                total_se_real += squared_error
-                total_se_events += mask_loss.sum().item()
+                mask_loss = (event_type[:, 1:] != Constants.PAD)
+                
+                # [RMSE 修正逻辑]
+                t_pred_integer = torch.clamp(t_pred_mean - 0.5, min=0.0)
+                gt_integer = torch.floor(gt_t_real)
+                
+                diff = (t_pred_integer - gt_integer)[mask_loss]
+                squared_error = (diff ** 2).sum().item()
+                total_sse += squared_error
+                total_events += mask_loss.sum().item()
+
+                # --- 3. 用于 Utils 指标计算的 Argmax 采样 ---
+                # [修复] 修正了 repeat 的维度错误
+                N = opt.n_samples
+                best_type = topk_indices[:, :, 0] # Top-1
+                pred_types_input = best_type + 1
+                pred_type_emb_best = model.encoder.event_type_emb(pred_types_input)
+                c_cond_best = model.type_fusion(c_time, pred_type_emb_best)
+                
+                # [Fix] 使用 repeat_interleave 替代 unsqueeze+repeat，避免维度报错
+                # (B, L, D) -> (B*N, L, D)
+                c_cond_expanded = c_cond_best.repeat_interleave(N, dim=0)
+                
+                x0_samples = torch.randn(B * N, L, 1, device=opt.device) * opt.fm_sigma
+                wrapper_samples = VelocityWrapper(model.v_field, c_cond_expanded)
+                solver.velocity_model = wrapper_samples
+                
+                x1_samples = solver.sample(x0_samples, torch.tensor([0.0, 1.0]), method=opt.solver_method, step_size=opt.solver_step_size)
+                t_sample_norm = x1_samples.view(B, N, L).squeeze(-1).permute(0, 2, 1)
 
                 metrics = Utils.evaluate_samples(
                     t_sample_norm,
                     time_gap_norm,
-                    pred_types,
+                    best_type, # Use Top-1 prediction for accuracy check
                     event_type,
                     opt
                 )
@@ -218,41 +246,41 @@ def eval_epoch(model, validation_data, eval_generation, opt):
                     total_il += metrics['il_sum']
                     total_crps += metrics['crps_sum']
                     total_acc += metrics['correct_type']
-                    total_events += metrics['total_events']
+                    # total_sse += metrics['sse_sum'] # [Skip] Use Top-K RMSE instead
 
         if total_events == 0: return {}
 
         final_acc = total_acc / total_events
-        final_crps = total_crps / total_events
-        final_il = total_il / total_events
+        final_rmse = np.sqrt(total_sse / total_events) if total_events > 0 else 0.0
         
-        final_rmse = np.sqrt(total_se_real / total_se_events) if total_se_events > 0 else 0.0
-        final_nll = total_nll / total_nll_events if total_nll_events > 0 else 0.0
+        if total_nll_events > 0:
+            avg_time_nll = total_time_nll / total_nll_events
+            avg_type_nll = total_type_nll / total_nll_events
+            avg_joint_nll = avg_time_nll + avg_type_nll
+        else:
+            avg_time_nll, avg_type_nll, avg_joint_nll = 0, 0, 0
 
         actual_coverage = total_hits / total_events
         target_coverage = opt.eval_quantile 
         mse = ((actual_coverage - target_coverage) ** 2).mean()
         final_cs = torch.sqrt(mse).item()
 
-        idx_05 = int(0.5 / opt.eval_quantile_step) - 1
-        if 0 <= idx_05 < len(actual_coverage):
-            cov_05 = actual_coverage[idx_05].item()
-            final_cer = abs(cov_05 - 0.5)
-        else:
-            final_cer = 0.0
-
-        print(f'  - (Test) Acc: {final_acc:.4f} | NLL: {final_nll:.4f} | RMSE: {final_rmse:.4f} | CRPS: {final_crps:.4f} | CS: {final_cs:.4f} | IL: {final_il:.4f}')
+        print(f'\n  - (Test Summary)')
+        print(f'    Acc:       {final_acc:.4f}')
+        print(f'    RMSE:      {final_rmse:.4f}')
+        print(f'    Time NLL:  {avg_time_nll:.4f}')
+        print(f'    Type NLL:  {avg_type_nll:.4f}')
+        print(f'    Joint NLL: {avg_joint_nll:.4f}')
+        print(f'    CS:        {final_cs:.4f}')
 
         return {
             'Acc': final_acc,
-            'NLL': final_nll,
+            'NLL': avg_joint_nll,
+            'Time_NLL': avg_time_nll,
+            'Type_NLL': avg_type_nll,
             'RMSE': final_rmse,
-            'CRPS': final_crps,
-            'CS': final_cs,
-            'CER': final_cer,
-            'IL': final_il
+            'CS': final_cs
         }
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -260,25 +288,30 @@ def main():
     parser.add_argument('-data', required=True)
     parser.add_argument('-normalize', type=str, default='log', choices=['normal', 'log'])
 
-    parser.add_argument('-d_model', type=int, default=64)
-    parser.add_argument('-d_inner_hid', type=int, default=128)
+    parser.add_argument('-d_model', type=int, default=128)
+    parser.add_argument('-d_inner_hid', type=int, default=256)
     parser.add_argument('-n_head', type=int, default=4)
     parser.add_argument('-n_layers', type=int, default=4)
     parser.add_argument('-dropout', type=float, default=0.1)
-    parser.add_argument('-d_k', type=int, default=16)
-    parser.add_argument('-d_v', type=int, default=16)
+    parser.add_argument('-d_k', type=int, default=32)
+    parser.add_argument('-d_v', type=int, default=32)
 
-    parser.add_argument('-fm_sigma', type=float, default=0.1)
+    # [Sigma=0.5] Balanced Variance
+    parser.add_argument('-fm_sigma', type=float, default=0.5)
+    
     parser.add_argument('-solver_method', type=str, default='euler')
     parser.add_argument('-solver_step_size', type=float, default=0.05)
-    parser.add_argument('-n_samples', type=int, default=50)
+    parser.add_argument('-n_samples', type=int, default=100)
     
     parser.add_argument('-d_latent', type=int, default=16)
 
     parser.add_argument('-batch_size', type=int, default=16)
-    parser.add_argument('-epoch', type=int, default=50)
-    parser.add_argument('-lr', type=float, default=1e-3)
-    parser.add_argument('-loss_lambda', type=float, default=1.0)
+    parser.add_argument('-epoch', type=int, default=60)
+    parser.add_argument('-lr', type=float, default=1e-4)
+    
+    # [Lambda=5.0] High weight for Type Accuracy
+    parser.add_argument('-loss_lambda', type=float, default=5.0)
+
     parser.add_argument('-eval_epoch', type=int, default=5) 
 
     parser.add_argument('-save_path', default='./checkpoint.pth')
@@ -290,11 +323,6 @@ def main():
     parser.add_argument('-load_path_name', type=str, default=None)
     parser.add_argument('-save_result', type=str, default=None)
     
-    parser.add_argument('-d_rnn', type=int, default=64)
-    parser.add_argument('-optimizer', type=str, default='adam')
-    parser.add_argument('-scheduler', type=str, default='cosLR')
-    parser.add_argument('-eval_quantile', type=int, default=-1)
-
     opt = parser.parse_args()
     opt.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -317,36 +345,29 @@ def main():
     if opt.just_eval:
         if opt.load_path_name is not None:
             print(f'[Info] Loading model from {opt.load_path_name} ...')
-            try:
-                state_dict = torch.load(opt.load_path_name, map_location=opt.device)
-                model.load_state_dict(state_dict)
-            except:
-                checkpoint = torch.load(opt.load_path_name, map_location=opt.device)
-                if 'model' in checkpoint:
-                    model.load_state_dict(checkpoint['model'])
-                else:
-                    model.load_state_dict(checkpoint, strict=False)
+            checkpoint = torch.load(opt.load_path_name, map_location=opt.device)
+            if 'model' in checkpoint:
+                model.load_state_dict(checkpoint['model'])
+            else:
+                model.load_state_dict(checkpoint, strict=False)
         else:
-            print("[Error] In just_eval mode, please provide -load_path_name!")
+            print("[Error] Provide -load_path_name for evaluation.")
             return
 
         print(f'[Info] Start Evaluation...')
         results = eval_epoch(model, testloader, True, opt)
-        
-        if opt.save_result:
+        if opt.save_result and results:
             df = pd.DataFrame([results])
             df.to_csv(f"{opt.save_result}_results.csv", index=False)
         return
 
     print(f'[Info] Model Parameters: {sum(p.numel() for p in model.parameters())}')
     optimizer = optim.Adam(model.parameters(), lr=opt.lr, weight_decay=1e-4)
-    
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.8)
     best_loss = float('inf')
 
     for epoch in range(1, opt.epoch + 1):
         print(f'[ Epoch {epoch} ]')
-        
         t_loss, t_fm, t_type = train_epoch(model, trainloader, optimizer, opt)
         print(f'  - (Train) Loss: {t_loss:.4f} | FM: {t_fm:.4f} | Type: {t_type:.4f}')
 
@@ -359,7 +380,7 @@ def main():
             torch.save(model.state_dict(), opt.save_path)
 
         if epoch % opt.eval_epoch == 0:
-            print("  - (Running Intermediate Generation Test...)")
+            print("  - (Running Generation Test...)")
             eval_epoch(model, testloader, True, opt)
 
         scheduler.step()

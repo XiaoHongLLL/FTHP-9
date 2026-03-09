@@ -1,7 +1,9 @@
+# -*- coding: utf-8 -*-
 import math
 import torch
 import torch.nn as nn
 import numpy as np
+import torch.nn.functional as F
 from transformer.Layers import get_non_pad_mask
 
 def softplus(x, beta):
@@ -34,82 +36,103 @@ def evaluate_samples(t_sample, gt_t, type_sample, event_type, opt):
     """
     根据 SMURF-THP 论文计算指标: CS, CER, IL, CRPS, Accuracy
     【新增】: RMSE (通过返回 SSE Sum 实现)
+    【关键修正】: Dequantization Mean Shift Correction (-0.5)
     """
 
     # ==========================================================
     # 1. 物理截断 (Physical Clamping)
     # ==========================================================
     if opt.normalize == 'log':
-        t_sample = torch.clamp(t_sample, min=-10.0, max=8.0)
+        t_sample = torch.clamp(t_sample, min=-10.0, max=10.0)
 
     # ==========================================================
     # 2. 反归一化 (Denormalize)
     # ==========================================================
     if opt.normalize == 'log':
-        # 仅还原 Log 变换，保持在 (x / mean) 的尺度 (SMURF 逻辑)
-        gt_t = torch.exp(gt_t * opt.var_log_data + opt.mean_log_data)
-        t_sample = torch.exp(t_sample * opt.var_log_data + opt.mean_log_data)
+        # 还原到 log 空间: x * std + mean
+        # 然后 exp 还原到真实时间空间
+        gt_t_real = torch.exp(gt_t * opt.var_log_data + opt.mean_log_data)
+        t_sample_real = torch.exp(t_sample * opt.var_log_data + opt.mean_log_data)
 
     elif opt.normalize == 'normal':
-        pass
+        gt_t_real = gt_t * opt.mean_data
+        t_sample_real = t_sample * opt.mean_data
+    else:
+        gt_t_real = gt_t
+        t_sample_real = t_sample
 
     # ==========================================================
-    # 3. 极值保护
+    # 3. [关键修正] Dequantization Mean Shift Correction
     # ==========================================================
-    max_val = getattr(opt, 'time_max', 1e7) * 2.0
-    t_sample = torch.clamp(t_sample, max=max_val)
+    # 训练时我们加了 U[0, 1]，期望偏移了 +0.5。
+    # 生成时，我们需要减去这个 0.5 才能对齐到原始整数网格。
+    # 此外，时间间隔不能小于 0。
+    t_sample_real = torch.clamp(t_sample_real - 0.5, min=0.0)
+    
+    # 对应的，为了计算精确的 RMSE，这里的 gt_t_real 应该是原始的整数数据
+    # 但 Dataset 传进来的 gt_t 是加了噪声的。
+    # 我们近似认为：gt_t_real (含噪) - 0.5 ≈ 原始整数 (在统计意义上)
+    gt_t_real = torch.clamp(gt_t_real - 0.5, min=0.0)
 
     # ==========================================================
-    # 4. 准备 Mask
+    # 4. 极值保护
+    # ==========================================================
+    max_val = getattr(opt, 'time_max', 1e7) * 5.0
+    t_sample_real = torch.clamp(t_sample_real, max=max_val)
+
+    # ==========================================================
+    # 5. 准备 Mask
     # ==========================================================
     non_pad_mask = get_non_pad_mask(event_type)  # (B, L, 1)
     valid_mask = non_pad_mask[:, 1:].squeeze(2)  # (B, L-1)
 
     # ==========================================================
-    # 5. 计算指标
+    # 6. 计算指标
     # ==========================================================
 
     # --- A. 计算覆盖率 (CS) ---
     target_quantiles = opt.eval_quantile # [0.05, ..., 0.95]
-    t_pred_quantiles = torch.quantile(t_sample, target_quantiles, dim=-1) # (n_q, B, L-1)
+    t_pred_quantiles = torch.quantile(t_sample_real, target_quantiles, dim=-1) # (n_q, B, L-1)
 
     # 计算每个分位数是否覆盖了真实值
-    hits_all = (gt_t.unsqueeze(0) <= t_pred_quantiles) * valid_mask.unsqueeze(0)
+    hits_all = (gt_t_real.unsqueeze(0) <= t_pred_quantiles) * valid_mask.unsqueeze(0)
     batch_hit_counts = hits_all.sum(dim=(1, 2))
 
-    # --- B. Interval Length (IL) - 【SMURF 逻辑】 ---
-    t_median = torch.quantile(t_sample, 0.5, dim=-1)
+    # --- B. Interval Length (IL) ---
+    t_median = torch.quantile(t_sample_real, 0.5, dim=-1)
     batch_il_sum = (t_median * valid_mask).sum().item()
 
     # --- C. CRPS ---
-    num_samples = t_sample.size(-1)
-    term1 = torch.abs(t_sample - gt_t.unsqueeze(-1)).mean(dim=-1)
+    num_samples = t_sample_real.size(-1)
+    term1 = torch.abs(t_sample_real - gt_t_real.unsqueeze(-1)).mean(dim=-1)
     
     if num_samples > 100:
         # 近似计算以节省显存
-        t_mean = t_sample.mean(dim=-1, keepdim=True)
-        term2 = torch.abs(t_sample - t_mean).mean(dim=-1) * 2 
+        t_mean = t_sample_real.mean(dim=-1, keepdim=True)
+        term2 = torch.abs(t_sample_real - t_mean).mean(dim=-1) * 2 
     else:
-        t_sample_perm = t_sample[:, :, torch.randperm(num_samples)]
-        term2 = torch.abs(t_sample - t_sample_perm).mean(dim=-1)
+        # Sample Pairwise distance
+        t_sample_perm = t_sample_real[:, :, torch.randperm(num_samples)]
+        term2 = torch.abs(t_sample_real - t_sample_perm).mean(dim=-1)
 
     crps_map = term1 - 0.5 * term2
     batch_crps_sum = (crps_map * valid_mask).sum().item()
 
     # --- D. Type Accuracy ---
     truth = event_type[:, 1:] - 1
-    if isinstance(type_sample, tuple):
-        type_sample = type_sample[0].argmax(dim=-1) if type_sample[0].ndim > 2 else type_sample[0]
+    # 兼容混合采样或 Argmax
+    if isinstance(type_sample, tuple) or (isinstance(type_sample, torch.Tensor) and type_sample.ndim > 2):
+        type_pred = type_sample if isinstance(type_sample, torch.Tensor) else type_sample[0]
+        if type_pred.ndim > 2: 
+             type_pred = type_pred.mode(dim=-1).values
+    else:
+        type_pred = type_sample
     
-    batch_correct_type = (type_sample.eq(truth) * valid_mask).sum().item()
+    batch_correct_type = (type_pred.eq(truth) * valid_mask).sum().item()
 
-    # --- [新增] E. RMSE 准备 (SSE Sum) ---
-    # t_sample: (B, L, N_samples) -> 在外面被permute过，通常是 (B, L, N) 或者 (B, N, L) 需要确认
-    # 注意：在 main.py 调用前 t_sample 已经是 (B, L, N) 或 (B, N, L)
-    # 让我们检查上游调用：t_sample_norm = x1_norm.view(B, N, L).squeeze(-1).permute(0, 2, 1) -> (B, L, N)
-    # 所以 dim=-1 是 sample 维度
-    t_pred_median = t_sample.median(dim=-1).values # 取样本均值作为点预测 (B, L)
-    se = (t_pred_median - gt_t) ** 2     # Squared Error
+    # --- E. SSE (for RMSE) ---
+    # 使用中位数作为点预测 (Robust prediction)
+    se = (t_median - gt_t_real) ** 2     
     batch_sse_sum = (se * valid_mask).sum().item()
 
     # --- F. 总事件数 ---
