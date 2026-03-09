@@ -1,9 +1,10 @@
+# -*- coding: utf-8 -*-
 import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchdiffeq import odeint  # 【新增】用于计算 Exact NLL
+from torchdiffeq import odeint
 
 import transformer.Constants as Constants
 from transformer.Layers import Encoder, get_non_pad_mask
@@ -110,7 +111,7 @@ class VectorField_Optimized(nn.Module):
         return out
 
 
-# --- 5. FlowMatchingTHP (核心修改) ---
+# --- 5. FlowMatchingTHP (核心修改：特征解耦) ---
 class FlowMatchingTHP(nn.Module):
 
     def __init__(self, num_types, config):
@@ -128,6 +129,23 @@ class FlowMatchingTHP(nn.Module):
             d_k=config.d_k,
             d_v=config.d_v,
             dropout=config.dropout,
+        )
+
+        # [NEW] Feature Decoupling Projectors
+        # 1. Type Projector: 专门提取语义分类特征 (Mapping to GMM centers)
+        self.type_projector = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_model, config.d_model)
+        )
+        
+        # 2. Time Projector: 专门提取连续时间特征 (Mapping to Flow Condition)
+        self.time_projector = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_model, config.d_model)
         )
 
         self.type_predictor = GMMClassifierHead(config.d_model, num_types)
@@ -154,20 +172,25 @@ class FlowMatchingTHP(nn.Module):
     def forward(self, event_type, event_time, time_gap_norm):
         non_pad_mask = get_non_pad_mask(event_type)
 
-        # 1. Encode History
-        enc_output = self.encoder(event_type, event_time, non_pad_mask)
+        # 1. Shared Encoder History
+        enc_output = self.encoder(event_type, event_time, non_pad_mask, time_gap_norm)
         c = enc_output[:, :-1, :]
 
-        # 2. Predict Type
-        type_logits = self.type_predictor(c)
+        # 2. [NEW] Decouple Features
+        c_type = self.type_projector(c)  # For Classification
+        c_time = self.time_projector(c)  # For Generation
 
-        # 3. Prepare Flow Condition
+        # 3. Predict Type (using c_type)
+        type_logits = self.type_predictor(c_type)
+
+        # 4. Prepare Flow Condition (using c_time)
         target_type_idx = event_type[:, 1:]
         target_type_emb = self.encoder.event_type_emb(target_type_idx)
+        
+        # Fuse Time Feature + Ground Truth Type (Teacher Forcing)
+        c_cond = self.type_fusion(c_time, target_type_emb)
 
-        c_cond = self.type_fusion(c, target_type_emb)
-
-        # 4. Flow Matching
+        # 5. Flow Matching
         x_1 = time_gap_norm.unsqueeze(-1)
         x_0 = torch.randn_like(x_1) * self.config.fm_sigma 
         
@@ -207,58 +230,57 @@ class FlowMatchingTHP(nn.Module):
 
         return total_loss, fm_loss.item(), type_loss.item()
     
-    # 【新增】计算 Exact NLL 的核心方法
     def get_exact_log_likelihood(self, event_type, event_time, time_gap_norm):
         """
         计算 Flow Matching 模型的真实 Log-Likelihood。
-        会自动将 NLL 从归一化空间还原到原始 Log-Time 空间，以便与 THP 对比。
+        使用 c_time 进行条件计算。
         """
         # 1. 准备 Condition
         non_pad_mask = get_non_pad_mask(event_type)
-        enc_output = self.encoder(event_type, event_time, non_pad_mask)
-        c = enc_output[:, :-1, :] # History Context
+        enc_output = self.encoder(event_type, event_time, non_pad_mask, time_gap_norm)
+        c = enc_output[:, :-1, :] 
+        
+        # [NEW] Use Time Projector
+        c_time = self.time_projector(c)
         
         target_type_idx = event_type[:, 1:]
         target_type_emb = self.encoder.event_type_emb(target_type_idx)
-        c_cond = self.type_fusion(c, target_type_emb) 
+        
+        # Fusion (using c_time)
+        c_cond = self.type_fusion(c_time, target_type_emb) 
 
         # 2. 准备数据 x1 (Data)
-        valid_mask = non_pad_mask[:, 1:].squeeze(-1).bool() # (B, L)
+        valid_mask = non_pad_mask[:, 1:].squeeze(-1).bool() 
+        x1 = time_gap_norm.unsqueeze(-1) 
         
-        x1 = time_gap_norm.unsqueeze(-1) # (B, L, 1)
-        
-        # 筛选有效数据 (N_events, 1)
         x1_flat = x1[valid_mask] 
         c_cond_flat = c_cond[valid_mask] 
         
         if x1_flat.shape[0] == 0:
             return torch.tensor(0.0, device=x1.device), 0
 
-        # 3. 定义带散度的 ODE 函数 (这里必须完整定义，不能省略)
+        # 3. ODE 函数
         def ode_func(t, states):
             x = states[0]
             with torch.enable_grad():
                 x.requires_grad_(True)
                 
-                # 适配 VectorField_Optimized 的 3D 输入需求: (N, 1, D)
-                x_in = x.unsqueeze(1) # (N, 1, 1)
+                x_in = x.unsqueeze(1) 
                 t_in = t * torch.ones(x.shape[0], 1, 1, device=x.device)
-                c_in = c_cond_flat.unsqueeze(1) # (N, 1, D)
+                c_in = c_cond_flat.unsqueeze(1) 
                 
-                v_out = self.v_field(x_in, t_in, c_in) # (N, 1, 1)
-                v = v_out.squeeze(1) # (N, 1)
+                v_out = self.v_field(x_in, t_in, c_in) 
+                v = v_out.squeeze(1) 
                 
-                # 计算散度 (Divergence) = dv/dx
                 grad_v = torch.autograd.grad(v.sum(), x, create_graph=True)[0]
                 divergence = grad_v.view(-1, 1)
                 
             return v, divergence
 
-        # 4. 逆向积分 (t=1 -> t=0)
+        # 4. 逆向积分
         z_t0 = x1_flat
         delta_logp_t0 = torch.zeros(x1_flat.shape[0], 1, device=x1.device)
         
-        # 使用高精度求解器计算 NLL
         times = torch.tensor([1.0, 0.0], device=x1.device)
         state_t = odeint(
             ode_func,
@@ -272,26 +294,23 @@ class FlowMatchingTHP(nn.Module):
         z_0 = state_t[0][-1]      
         delta_logp = state_t[1][-1] 
         
-        # 5. 计算 归一化空间 的 NLL
+        # 5. 计算 NLL
         sigma_fm = self.config.fm_sigma
         log_p_z0 = -0.5 * math.log(2 * math.pi) - math.log(sigma_fm) - 0.5 * (z_0 / sigma_fm)**2
         log_prob_norm = log_p_z0 + delta_logp
         nll_norm = -log_prob_norm.sum()
         
-        # 6. 还原到原始空间 (Change of Variables)
-        # NLL_orig = NLL_norm + sum( log(t) + log(data_sigma) )
-        
-        data_mu = self.mean_log_data
-        data_sigma = self.var_log_data
-        
-        # 恢复 log(t)
-        log_t = x1_flat * data_sigma + data_mu
-        
-        # 雅可比校正项
-        jacobian_term = log_t + math.log(data_sigma)
-        
-        # 总 NLL
-        nll_orig = nll_norm + jacobian_term.sum()
+        # 6. Jacobian 还原
+        if self.config.normalize == 'log':
+            data_mu = self.mean_log_data
+            data_sigma = self.var_log_data
+            log_t_val = x1_flat * data_sigma + data_mu
+            jacobian_term = log_t_val + math.log(data_sigma)
+            nll_orig = nll_norm + jacobian_term.sum()
+        elif self.config.normalize == 'normal':
+            nll_orig = nll_norm + math.log(self.mean_data) * x1_flat.shape[0]
+        else:
+            nll_orig = nll_norm
         
         return nll_orig, x1_flat.shape[0]
 
